@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: ["master"]
+    branches: ["master", "main-tes-features"]
   pull_request:
-    branches: ["master"]
+    branches: ["master", "main-tes-features"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,8 +15,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build --verbose
       - name: Run tests
-        run: cargo test --verbose
-
+        run: cargo test --locked --all-targets
+      - name: Verify MQTT recovery with Mosquitto
+        shell: bash
+        run: |
+          broker_config="$(mktemp)"
+          broker_name="vda5050-ci-mqtt"
+          trap 'docker rm -f "$broker_name" >/dev/null 2>&1 || true; rm -f "$broker_config"' EXIT
+          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' > "$broker_config"
+          chmod a+r "$broker_config"
+          docker run --rm -d --name "$broker_name" -p 127.0.0.1::1883 \
+            -v "$broker_config:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2
+          mqtt_addr="$(docker port "$broker_name" 1883/tcp)"
+          mqtt_port="${mqtt_addr##*:}"
+          for attempt in {1..30}; do
+            if (echo > "/dev/tcp/127.0.0.1/$mqtt_port") 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          VDA5050_TEST_MQTT_ADDR="$mqtt_addr" cargo test --locked --test mqtt_recovery_tests -- --ignored

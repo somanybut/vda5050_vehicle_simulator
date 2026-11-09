@@ -112,6 +112,19 @@ Once the simulator is running, it will start sending messages to the MQTT broker
 
 To visualize the robot's status and actions, you can adjust the `visualization_frequency` setting in `config.toml`.
 
+## Command retries and MQTT recovery
+
+- Retry an instant command with the same `actionId` and action contents. The simulator reports the original terminal result and does not repeat the load change. A changed MQTT header or timestamp does not create a new command. `stateRequest` reports the current state.
+- Retry the current order with the same `orderId`, `orderUpdateId` and route. Extend an order using a higher update ID and the last released node as the first node of the update. The simulator keeps the released route and its action results, and replaces the remaining horizon.
+- `cancelOrder` stops this model immediately and fails unfinished actions belonging to that order. A new cancellation with no active order reports `FAILED` and `noOrderToCancel`.
+- The broker retains `ONLINE`, the `CONNECTIONBROKEN` Last Will, and the `OFFLINE` report sent on Ctrl-C. Reconnect restores the subscriptions and publishes the current vehicle state. Command deduplication and results are held in memory across MQTT reconnects; a process restart resets them. The wire state reports order results only for the current order.
+
+Run the broker regression against a local MQTT 5 broker (the test cuts only the simulator's TCP connection and leaves the broker running):
+
+```sh
+VDA5050_TEST_MQTT_ADDR=127.0.0.1:1883 cargo test --locked --test mqtt_recovery_tests -- --ignored
+```
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for more details.

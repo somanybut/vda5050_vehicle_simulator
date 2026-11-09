@@ -52,7 +52,7 @@ fn execute_returns_silently_when_action_id_not_in_state() {
 }
 
 #[test]
-fn execute_unknown_action_type_still_marks_action_finished() {
+fn execute_unknown_action_type_fails_with_reason() {
     let handler = ActionHandler::new(1.0);
     let mut state = make_state();
     let mut viz = make_visualization();
@@ -61,7 +61,12 @@ fn execute_unknown_action_type_still_marks_action_finished() {
 
     handler.execute(&action, &mut state, &mut viz);
 
-    assert_eq!(state.action_states[0].action_status, ActionStatus::Finished);
+    assert_eq!(state.action_states[0].action_status, ActionStatus::Failed);
+    assert!(state.action_states[0]
+        .result_description
+        .as_deref()
+        .unwrap()
+        .contains("undefined"));
 }
 
 // -- initPosition ------------------------------------------------------
@@ -133,7 +138,10 @@ fn execute_pick_with_full_params_extracts_bounding_box_and_dimensions() {
             ("boundingBoxReferenceX", ActionParameterValue::Float(0.5)),
             ("boundingBoxReferenceY", ActionParameterValue::Float(0.3)),
             ("boundingBoxReferenceZ", ActionParameterValue::Float(0.2)),
-            ("boundingBoxReferenceTheta", ActionParameterValue::Float(0.0)),
+            (
+                "boundingBoxReferenceTheta",
+                ActionParameterValue::Float(0.0),
+            ),
             ("loadLength", ActionParameterValue::Float(1.2)),
             ("loadWidth", ActionParameterValue::Float(0.8)),
             ("loadHeight", ActionParameterValue::Float(1.5)),
@@ -145,9 +153,15 @@ fn execute_pick_with_full_params_extracts_bounding_box_and_dimensions() {
 
     let load = &state.loads[0];
     let bbox = load.bounding_box_reference.as_ref().unwrap();
-    assert_eq!((bbox.x, bbox.y, bbox.z, bbox.theta), (0.5, 0.3, 0.2, Some(0.0)));
+    assert_eq!(
+        (bbox.x, bbox.y, bbox.z, bbox.theta),
+        (0.5, 0.3, 0.2, Some(0.0))
+    );
     let dims = load.load_dimensions.as_ref().unwrap();
-    assert_eq!((dims.length, dims.width, dims.height), (1.2, 0.8, Some(1.5)));
+    assert_eq!(
+        (dims.length, dims.width, dims.height),
+        (1.2, 0.8, Some(1.5))
+    );
     assert_eq!(load.load_position.as_deref(), Some("front"));
 }
 

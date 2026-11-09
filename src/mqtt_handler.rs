@@ -1,171 +1,266 @@
-use futures_util::StreamExt;
+use std::error::Error;
+use std::time::Duration;
+
 use paho_mqtt as mqtt;
-use std::sync::Arc;
-use std::{process, time::Duration};
-use tokio::sync::Mutex;
+use tokio::sync::watch;
+use tokio::time::{self, Instant, Interval, MissedTickBehavior};
 
-use crate::config;
+use crate::config::Config;
 use crate::mqtt_utils;
-use crate::utils;
-use crate::vehicle_simulator::VehicleSimulator;
-use crate::protocol::vda_2_0_0::vda5050_2_0_0_order::Order;
+use crate::protocol::vda_2_0_0::vda5050_2_0_0_connection::{Connection, ConnectionState};
 use crate::protocol::vda_2_0_0::vda5050_2_0_0_instant_actions::InstantActions;
+use crate::protocol::vda_2_0_0::vda5050_2_0_0_order::Order;
+use crate::utils::get_timestamp;
+use crate::vehicle_simulator::VehicleSimulator;
 
-pub async fn subscribe_vda_messages(
-    config: config::Config, 
-    simulator: Arc<Mutex<VehicleSimulator>>
-) {
-    let base_topic = format!(
-        "{}/{}/{}/{}",
-        config.mqtt_broker.vda_interface,
-        config.vehicle.vda_version,
-        config.vehicle.manufacturer,
-        config.vehicle.serial_number,
-    );
+type SessionResult = Result<(), Box<dyn Error + Send + Sync>>;
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let topics = vec![
-        format!("{}/order", base_topic),
-        format!("{}/instantActions", base_topic),
-    ];
+struct Topics {
+    order: String,
+    instant_actions: String,
+    connection: String,
+    state: String,
+    visualization: String,
+}
 
-    if topics.is_empty() {
-        println!("Error: No topics specified!");
-        process::exit(-1);
-    }
-
-    let qos = vec![1; topics.len()];
-    let mut mqtt_client = create_mqtt_client();
-    let mut message_stream = mqtt_client.get_stream(25);
-
-    connect_to_broker(&mqtt_client).await;
-    subscribe_to_topics(&mqtt_client, &topics, &qos).await;
-
-    println!("Waiting for messages on topics: {:?}", topics);
-    
-    while let Some(msg_opt) = message_stream.next().await {
-        if let Some(msg) = msg_opt {
-            handle_incoming_message(msg, &simulator).await;
-        } else {
-            handle_connection_loss(&mqtt_client).await;
+impl Topics {
+    fn new(config: &Config) -> Self {
+        let vehicle = &config.vehicle;
+        let base = mqtt_utils::generate_vda_mqtt_base_topic(
+            &config.mqtt_broker.vda_interface,
+            &vehicle.vda_version,
+            &vehicle.manufacturer,
+            &vehicle.serial_number,
+        );
+        Self {
+            order: format!("{base}/order"),
+            instant_actions: format!("{base}/instantActions"),
+            connection: format!("{base}/connection"),
+            state: format!("{base}/state"),
+            visualization: format!("{base}/visualization"),
         }
     }
 }
 
-pub async fn publish_vda_messages(
-    simulator: Arc<Mutex<VehicleSimulator>>,
-    state_frequency: u64,
-    visualization_frequency: u64,
-) {
-    let mqtt_client = create_mqtt_client();
-    connect_to_broker(&mqtt_client).await;
+pub async fn run_vehicle(config: Config, mut shutdown: watch::Receiver<bool>) {
+    let topics = Topics::new(&config);
+    let mut simulator = VehicleSimulator::new(config.clone());
+    let mut ticks = time::interval(Duration::from_millis(50));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut connection_id = 0;
 
-    // Publish initial connection
-    simulator.lock().await.publish_connection(&mqtt_client).await;
-
-    // Main publishing loop
-    let tick_time = 50;
-    let mut state_counter = 0;
-    let mut visualization_counter = 0;
-
-    loop {
-        simulator.lock().await.update_state();
-
-        // Publish state at specified frequency
-        state_counter += 1;
-        if state_counter * tick_time > 1000 / state_frequency {
-            state_counter = 0;
-            simulator.lock().await.publish_state(&mqtt_client).await;
+    while !*shutdown.borrow() {
+        let result = run_session(
+            &config,
+            &topics,
+            &mut simulator,
+            &mut ticks,
+            &mut shutdown,
+            connection_id,
+        )
+        .await;
+        match result {
+            Ok(()) => return,
+            Err(error) => eprintln!(
+                "{} MQTT session ended: {error}",
+                config.vehicle.serial_number
+            ),
         }
-
-        // Publish visualization at specified frequency
-        visualization_counter += 1;
-        if visualization_counter * tick_time > 1000 / visualization_frequency {
-            visualization_counter = 0;
-            simulator.lock().await.publish_visualization(&mqtt_client).await;
+        // Each session reserves the next connection header ID for its Will.
+        connection_id += 2;
+        let retry = time::sleep(Duration::from_secs(1));
+        tokio::pin!(retry);
+        loop {
+            tokio::select! {
+                _ = &mut retry => break,
+                _ = shutdown.changed() => return,
+                _ = ticks.tick() => { simulator.update_state(); }
+            }
         }
-
-        tokio::time::sleep(Duration::from_millis(tick_time)).await;
     }
 }
 
-fn create_mqtt_client() -> mqtt::AsyncClient {
-    mqtt::AsyncClient::new(mqtt_utils::mqtt_create_opts()).unwrap_or_else(|e| {
-        println!("Error creating MQTT client: {:?}", e);
-        process::exit(-1);
-    })
-}
-
-async fn connect_to_broker(mqtt_client: &mqtt::AsyncClient) {
-    let broker_config = config::get_config().mqtt_broker;
-    let conn_opts = {
-        let mut builder = mqtt::ConnectOptionsBuilder::with_mqtt_version(mqtt::MQTT_VERSION_5);
-        builder.clean_start(true);
-        if let (Some(username), Some(password)) = (&broker_config.username, &broker_config.password) {
-            builder.user_name(username);
-            builder.password(password);
+async fn run_session(
+    config: &Config,
+    topics: &Topics,
+    simulator: &mut VehicleSimulator,
+    ticks: &mut Interval,
+    shutdown: &mut watch::Receiver<bool>,
+    online_id: u64,
+) -> SessionResult {
+    let mut client = mqtt::AsyncClient::new(mqtt_utils::mqtt_create_opts(&config.mqtt_broker))?;
+    // Avoid silently dropping QoS 1 commands or the disconnect notification
+    // when a burst fills Paho's stream buffer.
+    let incoming = client.get_stream(None);
+    let will = connection_message(
+        config,
+        topics,
+        online_id + 1,
+        ConnectionState::ConnectionBroken,
+    )?;
+    let connect = {
+        let mut options = mqtt::ConnectOptionsBuilder::with_mqtt_version(mqtt::MQTT_VERSION_5);
+        options
+            .clean_start(true)
+            .keep_alive_interval(Duration::from_secs(5))
+            .connect_timeout(IO_TIMEOUT)
+            .will_message(will);
+        if let (Some(username), Some(password)) =
+            (&config.mqtt_broker.username, &config.mqtt_broker.password)
+        {
+            options.user_name(username).password(password);
         }
-        builder.finalize()
+        client.connect(options.finalize())
     };
-    mqtt_client.connect(conn_opts).await.unwrap();
-}
-
-async fn subscribe_to_topics(
-    mqtt_client: &mqtt::AsyncClient, 
-    topics: &[String], 
-    qos: &[i32]
-) {
-    println!("Subscribing to topics: {:?}", topics);
-    mqtt_client.subscribe_many(topics, qos).await.unwrap();
-}
-
-async fn handle_incoming_message(
-    msg: mqtt::Message, 
-    simulator: &Arc<Mutex<VehicleSimulator>>
-) {
-    if msg.retained() {
-        print!("(R) ");
-    }
-
-    let topic = msg.topic();
-    let topic_type = utils::get_topic_type(topic);
-    let payload = String::from_utf8_lossy(msg.payload()).to_string();
-
-    match topic_type.as_ref() {
-        "order" => handle_order_message(&payload, simulator).await,
-        "instantActions" => handle_instant_actions_message(&payload, simulator).await,
-        _ => println!("Unknown topic type: {}", topic_type),
-    }
-}
-
-async fn handle_order_message(payload: &str, simulator: &Arc<Mutex<VehicleSimulator>>) {
-    match serde_json::from_str::<Order>(payload) {
-        Ok(order) => {
-            simulator.lock().await.process_order(order);
+    let establish = async {
+        time::timeout(IO_TIMEOUT, connect).await??;
+        let subscribed = time::timeout(
+            IO_TIMEOUT,
+            client.subscribe_many_same_qos(&[&topics.order, &topics.instant_actions], mqtt::QOS_1),
+        )
+        .await??;
+        if !subscribed
+            .subscribe_many_response()
+            .is_some_and(|codes| codes.len() == 2 && codes.iter().all(|code| *code < 128))
+        {
+            return Err("Broker rejected a vehicle subscription".into());
         }
-        Err(e) => {
-            println!("Error parsing order message: {}", e);
+        send(
+            &client,
+            connection_message(config, topics, online_id, ConnectionState::Online)?,
+        )
+        .await
+    };
+    tokio::pin!(establish);
+    loop {
+        tokio::select! {
+            result = &mut establish => { result?; break; }
+            _ = shutdown.changed() => {
+                if client.is_connected() {
+                    publish_offline(&client, config, topics, online_id + 1).await?;
+                }
+                return Ok(());
+            }
+            _ = ticks.tick() => { simulator.update_state(); }
         }
     }
-}
 
-async fn handle_instant_actions_message(payload: &str, simulator: &Arc<Mutex<VehicleSimulator>>) {
-    match serde_json::from_str::<InstantActions>(payload) {
-        Ok(instant_actions) => {
-            simulator.lock().await.accept_instant_actions(instant_actions);
-        }
-        Err(e) => {
-            println!("Error parsing instant actions message: {}", e);
+    publish_state(&client, topics, simulator).await?;
+    let state_period = Duration::from_secs_f64(1.0 / config.settings.state_frequency.max(1) as f64);
+    let viz_period =
+        Duration::from_secs_f64(1.0 / config.settings.visualization_frequency.max(1) as f64);
+    let mut next_state = Instant::now() + state_period;
+    let mut next_viz = Instant::now() + viz_period;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                return publish_offline(&client, config, topics, online_id + 1).await;
+            }
+            message = incoming.recv() => {
+                let Some(message) = message? else {
+                    return Err("MQTT connection lost".into());
+                };
+                if handle_message(&message, topics, simulator) {
+                    // A retransmit can recover the original terminal state immediately.
+                    publish_state(&client, topics, simulator).await?;
+                    next_state = Instant::now() + state_period;
+                }
+            }
+            _ = ticks.tick() => {
+                let changed = simulator.update_state();
+                if changed || Instant::now() >= next_state {
+                    publish_state(&client, topics, simulator).await?;
+                    next_state = Instant::now() + state_period;
+                }
+                if Instant::now() >= next_viz {
+                    simulator.visualization.header_id += 1;
+                    simulator.visualization.timestamp = get_timestamp();
+                    let payload = serde_json::to_vec(&simulator.visualization)?;
+                    send(&client, mqtt::Message::new(&topics.visualization, payload, mqtt::QOS_1)).await?;
+                    next_viz = Instant::now() + viz_period;
+                }
+            }
         }
     }
 }
 
-async fn handle_connection_loss(mqtt_client: &mqtt::AsyncClient) {
-    println!("Lost connection. Attempting to reconnect...");
-    
-    while let Err(err) = mqtt_client.reconnect().await {
-        println!("Error reconnecting: {}", err);
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+fn handle_message(
+    message: &mqtt::Message,
+    topics: &Topics,
+    simulator: &mut VehicleSimulator,
+) -> bool {
+    if message.retained() {
+        return false;
     }
-    
-    println!("Successfully reconnected to MQTT broker");
-} 
+    let result = if message.topic() == topics.order {
+        serde_json::from_slice::<Order>(message.payload())
+            .map(|order| simulator.process_order(order))
+    } else if message.topic() == topics.instant_actions {
+        serde_json::from_slice::<InstantActions>(message.payload())
+            .map(|actions| simulator.accept_instant_actions(actions))
+    } else {
+        return false;
+    };
+    if let Err(error) = result {
+        eprintln!("Invalid {} message: {error}", message.topic());
+        return false;
+    }
+    true
+}
+
+fn connection_message(
+    config: &Config,
+    topics: &Topics,
+    header_id: u64,
+    connection_state: ConnectionState,
+) -> serde_json::Result<mqtt::Message> {
+    let connection = Connection {
+        header_id,
+        timestamp: get_timestamp(),
+        version: config.vehicle.vda_full_version.clone(),
+        manufacturer: config.vehicle.manufacturer.clone(),
+        serial_number: config.vehicle.serial_number.clone(),
+        connection_state,
+    };
+    Ok(mqtt::Message::new_retained(
+        &topics.connection,
+        serde_json::to_vec(&connection)?,
+        mqtt::QOS_1,
+    ))
+}
+
+async fn publish_offline(
+    client: &mqtt::AsyncClient,
+    config: &Config,
+    topics: &Topics,
+    id: u64,
+) -> SessionResult {
+    send(
+        client,
+        connection_message(config, topics, id, ConnectionState::Offline)?,
+    )
+    .await?;
+    time::timeout(IO_TIMEOUT, client.disconnect(None)).await??;
+    Ok(())
+}
+
+async fn publish_state(
+    client: &mqtt::AsyncClient,
+    topics: &Topics,
+    simulator: &mut VehicleSimulator,
+) -> SessionResult {
+    simulator.state.header_id += 1;
+    simulator.state.timestamp = get_timestamp();
+    let payload = serde_json::to_vec(&simulator.state)?;
+    send(
+        client,
+        mqtt::Message::new(&topics.state, payload, mqtt::QOS_1),
+    )
+    .await
+}
+
+async fn send(client: &mqtt::AsyncClient, message: mqtt::Message) -> SessionResult {
+    time::timeout(IO_TIMEOUT, client.publish(message)).await??;
+    Ok(())
+}

@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use vda5050_vehicle_simulator::config::{Config, MqttBrokerConfig, Settings, VehicleConfig};
 use vda5050_vehicle_simulator::protocol::vda5050_common::{AgvPosition, NodePosition};
 use vda5050_vehicle_simulator::protocol::vda_2_0_0::vda5050_2_0_0_action::{
     Action, ActionParameter, ActionParameterValue, BlockingType,
@@ -23,6 +24,32 @@ pub const MANUFACTURER: &str = "TEST";
 pub const SERIAL_NUMBER: &str = "TEST-AGV-001";
 pub const VERSION: &str = "2.0.0";
 pub const MAP_ID: &str = "test_map";
+
+pub fn make_config() -> Config {
+    Config {
+        mqtt_broker: MqttBrokerConfig {
+            host: "127.0.0.1".into(),
+            port: "1883".into(),
+            vda_interface: "uagv".into(),
+            username: None,
+            password: None,
+        },
+        vehicle: VehicleConfig {
+            manufacturer: MANUFACTURER.into(),
+            serial_number: SERIAL_NUMBER.into(),
+            vda_version: "v2".into(),
+            vda_full_version: VERSION.into(),
+        },
+        settings: Settings {
+            action_time: 0.0,
+            speed: 0.5,
+            robot_count: 1,
+            state_frequency: 1,
+            visualization_frequency: 1,
+            map_id: MAP_ID.into(),
+        },
+    }
+}
 
 pub fn make_state() -> State {
     State {
@@ -139,10 +166,7 @@ pub fn make_init_position_action(
             ("y", ActionParameterValue::Float(y)),
             ("theta", ActionParameterValue::Float(theta)),
             ("mapId", ActionParameterValue::Str(MAP_ID.into())),
-            (
-                "lastNodeId",
-                ActionParameterValue::Str(last_node_id.into()),
-            ),
+            ("lastNodeId", ActionParameterValue::Str(last_node_id.into())),
         ],
     )
 }

@@ -8,28 +8,16 @@ pub use instant_actions_manager::InstantActionsManager;
 pub use navigator::Navigator;
 pub use order_manager::OrderManager;
 
-use paho_mqtt as mqtt;
-use std::time::Duration;
-use tokio::time::sleep;
-
 use crate::config;
-use crate::mqtt_utils;
 use crate::protocol::vda5050_common::AgvPosition;
-use crate::protocol::vda_2_0_0::vda5050_2_0_0_connection::{Connection, ConnectionState};
 use crate::protocol::vda_2_0_0::vda5050_2_0_0_instant_actions::InstantActions;
 use crate::protocol::vda_2_0_0::vda5050_2_0_0_order::Order;
 use crate::protocol::vda_2_0_0::vda5050_2_0_0_state::{
-    BatteryState, EStop, OperatingMode, SafetyState, State,
+    ActionStatus, BatteryState, EStop, Error, ErrorLevel, ErrorReference, OperatingMode,
+    SafetyState, State,
 };
 use crate::protocol::vda_2_0_0::vda5050_2_0_0_visualization::Visualization;
 use crate::utils;
-
-/// MQTT topics derived once at construction time.
-struct Topics {
-    connection: String,
-    state: String,
-    visualization: String,
-}
 
 /// Top-level vehicle simulator. Acts as a thin facade that owns the protocol
 /// payloads and delegates behaviour to focused collaborators:
@@ -40,8 +28,6 @@ struct Topics {
 ///   `instantActions` topic.
 /// - [`Navigator`] advances the AGV one tick at a time.
 pub struct VehicleSimulator {
-    topics: Topics,
-    connection: Connection,
     pub state: State,
     pub visualization: Visualization,
 
@@ -53,26 +39,10 @@ pub struct VehicleSimulator {
 
 impl VehicleSimulator {
     pub fn new(config: config::Config) -> Self {
-        let base_topic = mqtt_utils::generate_vda_mqtt_base_topic(
-            &config.mqtt_broker.vda_interface,
-            &config.vehicle.vda_version,
-            &config.vehicle.manufacturer,
-            &config.vehicle.serial_number,
-        );
-
-        let topics = Topics {
-            connection: format!("{}/connection", base_topic),
-            state: format!("{}/state", base_topic),
-            visualization: format!("{}/visualization", base_topic),
-        };
-
-        let connection = build_initial_connection(&config);
         let (state, agv_position) = build_initial_state(&config);
         let visualization = build_initial_visualization(&config, &agv_position);
 
         Self {
-            topics,
-            connection,
             state,
             visualization,
             action_handler: ActionHandler::new(config.settings.action_time),
@@ -85,8 +55,11 @@ impl VehicleSimulator {
     // -- Order / instant action intake -------------------------------------
 
     pub fn process_order(&mut self, order_request: Order) {
+        let instant_actions = &self.instant_actions_manager;
         self.order_manager
-            .process_order(order_request, &mut self.state);
+            .process_order_with(order_request, &mut self.state, |id| {
+                instant_actions.contains_id(id)
+            });
     }
 
     pub fn accept_instant_actions(&mut self, request: InstantActions) {
@@ -100,91 +73,102 @@ impl VehicleSimulator {
 
     // -- Simulation tick ---------------------------------------------------
 
-    /// Drives one simulation tick: runs any pending instant actions, then
-    /// any waiting node action, and finally advances the AGV's position.
-    pub fn update_state(&mut self) {
-        if self.action_handler.is_busy() {
-            return;
+    /// Advance one tick. Returns whether an action, movement transition or
+    /// node arrival warrants an immediate state report.
+    pub fn update_state(&mut self) -> bool {
+        let mut changed = self.run_pending_instant_actions();
+        if self.action_handler.is_busy() || !self.order_manager.has_order() {
+            return changed;
         }
 
-        self.process_instant_actions();
-
-        if !self.order_manager.has_order() {
-            return;
-        }
-
-        if let Some(action) = self.order_manager.next_node_action(&self.state) {
-            println!("Executing action type: {:?}", action.action_type);
+        if let Some(action) = self
+            .order_manager
+            .next_node_action(&self.state)
+            .or_else(|| self.order_manager.next_edge_action(&self.state))
+        {
             self.action_handler.mark_started();
             self.action_handler
                 .execute(&action, &mut self.state, &mut self.visualization);
+            return true;
         }
 
+        let previous = (
+            self.state.last_node_sequence_id,
+            self.state.node_states.len(),
+            self.state.driving,
+        );
         self.navigator
             .step(&mut self.state, &mut self.visualization);
+        self.order_manager.update_base_request(&mut self.state);
+        changed |= previous
+            != (
+                self.state.last_node_sequence_id,
+                self.state.node_states.len(),
+                self.state.driving,
+            );
+        changed
     }
 
-    /// Run any instant actions that are still in the `Waiting` state.
     pub fn process_instant_actions(&mut self) {
-        let pending = self.instant_actions_manager.pending(&self.state);
-        for action in pending {
-            self.action_handler
-                .execute(&action, &mut self.state, &mut self.visualization);
+        self.run_pending_instant_actions();
+    }
+
+    fn run_pending_instant_actions(&mut self) -> bool {
+        let mut changed = false;
+        for action in self.instant_actions_manager.pending(&self.state) {
+            match action.action_type.as_str() {
+                "cancelOrder" => self.cancel_order(&action.action_id),
+                "stateRequest" => self.finish_instant_action(&action.action_id, Ok(())),
+                _ if self.action_handler.is_busy() => continue,
+                _ => self
+                    .action_handler
+                    .execute(&action, &mut self.state, &mut self.visualization),
+            }
+            self.instant_actions_manager
+                .record_result(&action.action_id, &self.state);
+            changed = true;
+        }
+        changed
+    }
+
+    fn cancel_order(&mut self, action_id: &str) {
+        if self.order_manager.cancel(&mut self.state) {
+            self.action_handler.clear_busy();
+            self.visualization.velocity = None;
+            self.finish_instant_action(action_id, Ok(()));
+        } else {
+            let reason = "No active order to cancel";
+            self.state
+                .errors
+                .retain(|e| e.error_type != "noOrderToCancel");
+            self.state.errors.push(Error {
+                error_type: "noOrderToCancel".into(),
+                error_level: ErrorLevel::Warning,
+                error_description: Some(reason.into()),
+                error_references: vec![ErrorReference {
+                    reference_key: "actionId".into(),
+                    reference_value: action_id.into(),
+                }],
+            });
+            self.finish_instant_action(action_id, Err(reason));
         }
     }
 
-    // -- MQTT publishing ---------------------------------------------------
-
-    pub async fn publish_connection(&mut self, mqtt_cli: &mqtt::AsyncClient) {
-        // Initial "broken" announce so subscribers know the previous session ended.
-        let json_broken = serde_json::to_string(&self.connection).unwrap();
-        mqtt_utils::mqtt_publish(mqtt_cli, &self.topics.connection, &json_broken)
-            .await
-            .unwrap();
-
-        sleep(Duration::from_millis(1000)).await;
-
-        self.connection.header_id += 1;
-        self.connection.timestamp = utils::get_timestamp();
-        self.connection.connection_state = ConnectionState::Online;
-
-        let json_online = serde_json::to_string(&self.connection).unwrap();
-        mqtt_utils::mqtt_publish(mqtt_cli, &self.topics.connection, &json_online)
-            .await
-            .unwrap();
-    }
-
-    pub async fn publish_visualization(&mut self, mqtt_cli: &mqtt::AsyncClient) {
-        self.visualization.header_id += 1;
-        self.visualization.timestamp = utils::get_timestamp();
-
-        let payload = serde_json::to_string(&self.visualization).unwrap();
-        mqtt_utils::mqtt_publish(mqtt_cli, &self.topics.visualization, &payload)
-            .await
-            .unwrap();
-    }
-
-    pub async fn publish_state(&mut self, mqtt_cli: &mqtt::AsyncClient) {
-        self.state.header_id += 1;
-        self.state.timestamp = utils::get_timestamp();
-
-        let payload = serde_json::to_string(&self.state).unwrap();
-        mqtt_utils::mqtt_publish(mqtt_cli, &self.topics.state, &payload)
-            .await
-            .unwrap();
-    }
-}
-
-// -- Initial protocol payloads ---------------------------------------------
-
-fn build_initial_connection(config: &config::Config) -> Connection {
-    Connection {
-        header_id: 0,
-        timestamp: utils::get_timestamp(),
-        version: config.vehicle.vda_full_version.clone(),
-        manufacturer: config.vehicle.manufacturer.clone(),
-        serial_number: config.vehicle.serial_number.clone(),
-        connection_state: ConnectionState::ConnectionBroken,
+    fn finish_instant_action(&mut self, id: &str, result: Result<(), &str>) {
+        if let Some(action) = self
+            .state
+            .action_states
+            .iter_mut()
+            .find(|a| a.action_id == id && a.action_status == ActionStatus::Waiting)
+        {
+            match result {
+                Ok(()) => action.action_status = ActionStatus::Finished,
+                Err(reason) => {
+                    action.action_status = ActionStatus::Failed;
+                    action.result_description = Some(reason.into());
+                }
+            }
+        }
     }
 }
 

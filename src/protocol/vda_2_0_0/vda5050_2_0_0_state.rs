@@ -91,7 +91,7 @@ pub struct EdgeState {
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionState {
     /// Unique action_id, e.g. blink_123jdaimoim234
@@ -107,7 +107,7 @@ pub struct ActionState {
 }
 
 /// Status of an Action.
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[derive(Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ActionStatus {
@@ -123,6 +123,12 @@ pub enum ActionStatus {
     Finished,
     /// Action could not be finished for whatever reason.
     Failed
+}
+
+impl ActionStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed)
+    }
 }
 
 /// Load object that describes the load if the AGV has information about it.

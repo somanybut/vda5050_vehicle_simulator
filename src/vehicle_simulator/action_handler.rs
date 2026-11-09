@@ -40,31 +40,50 @@ impl ActionHandler {
         self.action_start_time = Some(Utc::now());
     }
 
-    /// Executes a single action, transitioning the matching `ActionState`
-    /// from `Running` to `Finished`. Unknown action types are logged and
-    /// ignored.
+    pub(super) fn clear_busy(&mut self) {
+        self.action_start_time = None;
+    }
+
+    /// Only a Waiting action can acquire the right to mutate the vehicle.
     pub fn execute(&self, action: &Action, state: &mut State, visualization: &mut Visualization) {
-        let Some(idx) = Self::find_action_state_index(state, &action.action_id) else {
+        let Some(idx) = state.action_states.iter().position(|s| {
+            s.action_id == action.action_id && s.action_status == ActionStatus::Waiting
+        }) else {
             return;
         };
 
         state.action_states[idx].action_status = ActionStatus::Running;
+        let result = match action.action_type.as_str() {
+            "initPosition" => {
+                Self::run_init_position(action, state, visualization);
+                Ok(None)
+            }
+            "pick" => {
+                Self::run_pick(action, state);
+                Ok(state
+                    .loads
+                    .last()
+                    .and_then(|load| load.load_id.as_ref())
+                    .map(|id| format!("Picked load {id}")))
+            }
+            "drop" => {
+                Self::run_drop(action, state);
+                Ok(None)
+            }
+            other => Err(format!("Unsupported action type: {other}")),
+        };
 
-        match action.action_type.as_str() {
-            "initPosition" => Self::run_init_position(action, state, visualization),
-            "pick" => Self::run_pick(action, state),
-            "drop" => Self::run_drop(action, state),
-            other => println!("Unknown action type: {}", other),
+        let action_state = &mut state.action_states[idx];
+        match result {
+            Ok(description) => {
+                action_state.action_status = ActionStatus::Finished;
+                action_state.result_description = description;
+            }
+            Err(reason) => {
+                action_state.action_status = ActionStatus::Failed;
+                action_state.result_description = Some(reason);
+            }
         }
-
-        state.action_states[idx].action_status = ActionStatus::Finished;
-    }
-
-    fn find_action_state_index(state: &State, action_id: &str) -> Option<usize> {
-        state
-            .action_states
-            .iter()
-            .position(|x| x.action_id == action_id)
     }
 
     fn run_init_position(action: &Action, state: &mut State, visualization: &mut Visualization) {
@@ -173,12 +192,14 @@ impl<'a> ActionParams<'a> {
         let load_position = self.string("loadPosition");
         let weight = self.float("weight");
 
-        let bounding_box_reference = self.has("boundingBoxReferenceX").then(|| BoundingBoxReference {
-            x: self.float("boundingBoxReferenceX"),
-            y: self.float("boundingBoxReferenceY"),
-            z: self.float("boundingBoxReferenceZ"),
-            theta: self.optional_float("boundingBoxReferenceTheta"),
-        });
+        let bounding_box_reference =
+            self.has("boundingBoxReferenceX")
+                .then(|| BoundingBoxReference {
+                    x: self.float("boundingBoxReferenceX"),
+                    y: self.float("boundingBoxReferenceY"),
+                    z: self.float("boundingBoxReferenceZ"),
+                    theta: self.optional_float("boundingBoxReferenceTheta"),
+                });
 
         let load_dimensions = self.has("loadLength").then(|| LoadDimensions {
             length: self.float("loadLength"),

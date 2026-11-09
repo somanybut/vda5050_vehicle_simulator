@@ -1,8 +1,6 @@
 //! Integration tests for `OrderManager`.
 //!
-//! Every test uses the public `OrderManager` API. The private rejection
-//! reasons (`is_vehicle_close_to_last_released_node`, `can_accept_new_order`)
-//! are covered indirectly through `process_order` outcomes.
+//! Exercises route intake and action selection through the public API.
 
 mod common;
 
@@ -30,7 +28,7 @@ fn ready_is_false_when_node_states_present() {
     let mut state = make_state_with_position(0.0, 0.0);
     state
         .node_states
-        .push(make_node_state("n1", 1, 0.0, 0.0, true));
+        .push(make_node_state("n1", 0, 0.0, 0.0, true));
     assert!(!OrderManager::is_vehicle_ready_for_new_order(&state));
 }
 
@@ -60,7 +58,7 @@ fn next_node_action_returns_first_waiting_action_on_current_node() {
         0,
         vec![make_node(
             "n1",
-            1,
+            0,
             0.0,
             0.0,
             true,
@@ -69,7 +67,6 @@ fn next_node_action_returns_first_waiting_action_on_current_node() {
         vec![],
     );
     manager.process_order(order, &mut state);
-    state.last_node_sequence_id = 1;
 
     let next = manager.next_node_action(&state).expect("has next");
     assert_eq!(next.action_id, "pick-1");
@@ -86,7 +83,7 @@ fn next_node_action_skips_already_finished_actions() {
         0,
         vec![make_node(
             "n1",
-            1,
+            0,
             0.0,
             0.0,
             true,
@@ -95,7 +92,6 @@ fn next_node_action_skips_already_finished_actions() {
         vec![],
     );
     manager.process_order(order, &mut state);
-    state.last_node_sequence_id = 1;
     state.action_states[0].action_status = ActionStatus::Finished;
 
     let next = manager.next_node_action(&state).expect("has next");
@@ -110,11 +106,10 @@ fn next_node_action_returns_none_when_all_actions_finished() {
     let order = make_order(
         "ord-1",
         0,
-        vec![make_node("n1", 1, 0.0, 0.0, true, vec![pick.clone()])],
+        vec![make_node("n1", 0, 0.0, 0.0, true, vec![pick.clone()])],
         vec![],
     );
     manager.process_order(order, &mut state);
-    state.last_node_sequence_id = 1;
     state.action_states[0].action_status = ActionStatus::Finished;
 
     assert!(manager.next_node_action(&state).is_none());
@@ -131,7 +126,7 @@ fn has_order_reflects_acceptance() {
     let order = make_order(
         "ord-1",
         0,
-        vec![make_node("n1", 1, 0.0, 0.0, true, vec![])],
+        vec![make_node("n1", 0, 0.0, 0.0, true, vec![])],
         vec![],
     );
     manager.process_order(order, &mut state);
@@ -148,7 +143,7 @@ fn process_order_accepts_new_order_when_vehicle_is_ready() {
         "ord-1",
         0,
         vec![
-            make_node("n1", 1, 0.0, 0.0, true, vec![]),
+            make_node("n1", 0, 0.0, 0.0, true, vec![]),
             make_node("n2", 2, 5.0, 0.0, true, vec![]),
         ],
         vec![make_edge("e1", 1, "n1", "n2", true, vec![])],
@@ -170,7 +165,7 @@ fn process_order_rejects_new_order_when_position_not_initialized() {
     let order = make_order(
         "ord-1",
         0,
-        vec![make_node("n1", 1, 0.0, 0.0, true, vec![])],
+        vec![make_node("n1", 0, 0.0, 0.0, true, vec![])],
         vec![],
     );
 
@@ -181,18 +176,13 @@ fn process_order_rejects_new_order_when_position_not_initialized() {
 }
 
 #[test]
-fn process_order_rejects_when_vehicle_too_far_from_last_released_node() {
+fn process_order_rejects_when_first_node_is_not_reachable() {
     let mut manager = OrderManager::new();
-    // Vehicle at origin, but a previous order has a released node at (5, 0)
-    // which is way more than 0.1 away.
     let mut state = make_state_with_position(0.0, 0.0);
-    state
-        .node_states
-        .push(make_node_state("prev", 1, 5.0, 0.0, true));
     let order = make_order(
         "ord-1",
         0,
-        vec![make_node("n1", 1, 0.0, 0.0, true, vec![])],
+        vec![make_node("n1", 0, 5.0, 0.0, true, vec![])],
         vec![],
     );
 
@@ -210,11 +200,14 @@ fn process_order_rejects_update_with_lower_or_equal_update_id() {
     let mut state = make_state_with_position(0.0, 0.0);
     let original = make_order(
         "ord-1",
-        5,
-        vec![make_node("n1", 1, 0.0, 0.0, true, vec![])],
+        0,
+        vec![make_node("n1", 0, 0.0, 0.0, true, vec![])],
         vec![],
     );
-    manager.process_order(original, &mut state);
+    manager.process_order(original.clone(), &mut state);
+    let mut accepted = original;
+    accepted.order_update_id = 5;
+    manager.process_order(accepted, &mut state);
 
     let same = make_order(
         "ord-1",
@@ -243,18 +236,17 @@ fn process_order_accepts_update_with_higher_update_id() {
     let mut state = make_state_with_position(0.0, 0.0);
     let original = make_order(
         "ord-1",
-        1,
-        vec![make_node("n1", 1, 0.0, 0.0, true, vec![])],
+        0,
+        vec![make_node("n1", 0, 0.0, 0.0, true, vec![])],
         vec![],
     );
     manager.process_order(original, &mut state);
-    state.last_node_sequence_id = 1;
 
     let updated = make_order(
         "ord-1",
         2,
         vec![
-            make_node("n1", 1, 0.0, 0.0, true, vec![]),
+            make_node("n1", 0, 0.0, 0.0, true, vec![]),
             make_node("n2", 2, 1.0, 0.0, true, vec![]),
         ],
         vec![make_edge("e1", 1, "n1", "n2", true, vec![])],
@@ -264,7 +256,7 @@ fn process_order_accepts_update_with_higher_update_id() {
     assert_eq!(state.order_update_id, 2);
     assert_eq!(state.node_states.len(), 2);
     assert_eq!(state.edge_states.len(), 1);
-    assert_eq!(state.last_node_sequence_id, 1);
+    assert_eq!(state.last_node_sequence_id, 0);
 }
 
 #[test]
@@ -277,7 +269,7 @@ fn accept_order_registers_action_states_for_node_and_edge_actions() {
         "ord-1",
         0,
         vec![
-            make_node("n1", 1, 0.0, 0.0, true, vec![pick.clone()]),
+            make_node("n1", 0, 0.0, 0.0, true, vec![pick.clone()]),
             make_node("n2", 2, 1.0, 0.0, true, vec![]),
         ],
         vec![make_edge("e1", 1, "n1", "n2", true, vec![drop.clone()])],

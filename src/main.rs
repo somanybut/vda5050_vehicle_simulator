@@ -1,56 +1,31 @@
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-
-mod config;
-mod mqtt_utils;
-mod protocol;
-mod utils;
-mod vehicle_simulator;
-mod mqtt_handler;
-
-use vehicle_simulator::VehicleSimulator;
-use mqtt_handler::{subscribe_vda_messages, publish_vda_messages};
+use tokio::sync::watch;
+use vda5050_vehicle_simulator::{config, mqtt_handler};
 
 #[tokio::main]
 async fn main() {
-    let config = crate::config::get_config();
+    let config = config::get_config();
+    let (shutdown, stop) = watch::channel(false);
+    let mut vehicles = Vec::new();
 
-    for robot_index in 0..config.settings.robot_count {
-        spawn_vehicle_simulator(config.clone(), robot_index).await;
+    for index in 0..config.settings.robot_count {
+        let mut vehicle = config.clone();
+        if config.settings.robot_count > 1 {
+            vehicle.vehicle.serial_number =
+                format!("{}{}", config.vehicle.serial_number, index + 1);
+        }
+        vehicles.push(tokio::spawn(mqtt_handler::run_vehicle(
+            vehicle,
+            stop.clone(),
+        )));
     }
 
-    // Keep the main thread alive
-    loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("Could not wait for Ctrl-C: {error}");
     }
-}
-
-async fn spawn_vehicle_simulator(config: config::Config, robot_index: u32) {
-    // Create vehicle-specific configuration
-    let mut vehicle_config = config.clone();
-    if vehicle_config.settings.robot_count > 1 {
-        vehicle_config.vehicle.serial_number = format!("{}{}", config.vehicle.serial_number, robot_index + 1);
+    let _ = shutdown.send(true);
+    for vehicle in vehicles {
+        if let Err(error) = vehicle.await {
+            eprintln!("Vehicle task failed: {error}");
+        }
     }
-    
-    // Create and share vehicle simulator
-    let vehicle_simulator = VehicleSimulator::new(vehicle_config.clone());
-    let shared_simulator = Arc::new(Mutex::new(vehicle_simulator));
-    
-    // Clone for async tasks
-    let simulator_for_subscribe = Arc::clone(&shared_simulator);
-    let simulator_for_publish = Arc::clone(&shared_simulator);
-
-    // Spawn MQTT subscription task
-    tokio::spawn(subscribe_vda_messages(
-        vehicle_config,
-        simulator_for_subscribe,
-    ));
-
-    // Spawn MQTT publishing task
-    tokio::spawn(publish_vda_messages(
-        simulator_for_publish,
-        config.settings.state_frequency,
-        config.settings.visualization_frequency,
-    ));
 }

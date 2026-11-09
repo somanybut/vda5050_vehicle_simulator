@@ -21,6 +21,7 @@ impl Navigator {
     /// reached and keeps `visualization.agv_position` in lockstep with the
     /// authoritative `state.agv_position`.
     pub fn step(&self, state: &mut State, visualization: &mut Visualization) {
+        state.driving = false;
         if state.agv_position.is_none() || state.node_states.is_empty() {
             return;
         }
@@ -33,7 +34,7 @@ impl Navigator {
         let Some(next_node) = self.next_node(state).cloned() else {
             return;
         };
-        if !next_node.released {
+        if !next_node.released || !state.edge_states.first().is_some_and(|edge| edge.released) {
             return;
         }
 
@@ -56,11 +57,23 @@ impl Navigator {
             next_node_position.x,
             next_node_position.y,
         );
-        let should_arrive = distance < self.speed + 0.1;
+        let should_arrive = distance <= self.speed
+            && utils::get_distance(new_x, new_y, next_node_position.x, next_node_position.y)
+                <= self.speed;
+        state.driving =
+            !should_arrive && (new_x != vehicle_position.x || new_y != vehicle_position.y);
 
         if let Some(agv_pos) = &mut state.agv_position {
-            agv_pos.x = new_x;
-            agv_pos.y = new_y;
+            agv_pos.x = if should_arrive {
+                next_node_position.x
+            } else {
+                new_x
+            };
+            agv_pos.y = if should_arrive {
+                next_node_position.y
+            } else {
+                new_y
+            };
             agv_pos.theta = new_theta;
             visualization.agv_position = Some(agv_pos.clone());
         }

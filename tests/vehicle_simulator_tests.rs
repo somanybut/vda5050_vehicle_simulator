@@ -81,7 +81,7 @@ fn create_small_order() -> Order {
         nodes: vec![
             Node {
                 node_id: "node_001".to_string(),
-                sequence_id: 1,
+                sequence_id: 0,
                 node_description: Some("Start node".to_string()),
                 released: true,
                 node_position: Some(NodePosition {
@@ -219,22 +219,10 @@ fn test_small_order_completion() {
     assert_eq!(simulator.state.node_states[1].node_id, "node_002");
     assert_eq!(simulator.state.node_states[1].released, true);
     
-    // Simulate vehicle movement to complete the order
-    // First, move to first node (should be already there since position matches)
     simulator.update_state();
-    
-    // Since the vehicle starts at the same position as the first node,
-    // it should immediately be considered to have reached that node
-    // The first node should be removed and last_node_sequence_id should be updated
-    if simulator.state.node_states.len() == 1 {
-        // First node was removed, verify we're now targeting the second node
-        assert_eq!(simulator.state.last_node_sequence_id, 1);
-    } else {
-        // First node is still there, which means we need to move to it
-        assert_eq!(simulator.state.node_states.len(), 2);
-        assert_eq!(simulator.state.last_node_sequence_id, 0);
-    }
-    
+    assert_eq!(simulator.state.last_node_sequence_id, 0);
+    assert!(simulator.state.driving);
+
     // Continue moving to complete the order
     for _ in 0..100 { // Allow enough iterations to reach the target
         simulator.update_state();
@@ -747,9 +735,6 @@ fn test_pick_action_as_order_action() {
     // Initially, no loads
     assert_eq!(simulator.state.loads.len(), 0);
     
-    // Set last_node_sequence_id to match the first node so actions can be processed
-    simulator.state.last_node_sequence_id = 1;
-    
     // Process node actions (this should execute the pick action)
     simulator.update_state();
     
@@ -804,9 +789,6 @@ fn test_drop_action_as_order_action() {
     
     // Verify action state was added
     assert!(simulator.state.action_states.iter().any(|a| a.action_id == "drop_LOAD-010"));
-    
-    // Set last_node_sequence_id to match the first node so actions can be processed
-    simulator.state.last_node_sequence_id = 1;
     
     // Process node actions (this should execute the drop action)
     simulator.update_state();
