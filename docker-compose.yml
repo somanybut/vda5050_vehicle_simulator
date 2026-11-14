@@ -1,20 +1,28 @@
-# Base compose file – uses a pre-built image and expects an external MQTT broker.
+# Base compose file – uses a pre-built simulator image and includes a local MQTT broker.
 # To build from source locally, docker-compose.override.yml is applied automatically.
 #
-# Configure the broker address and all other parameters in config.toml before
-# starting the container. If your broker runs on the Docker host machine you can
-# use "host.docker.internal" as the host value on macOS / Windows, or rely on
-# the extra_hosts entry below on Linux.
+# The simulator connects to the included broker through the service name "mqtt".
+# To use an external broker instead, adjust config.toml before starting the container.
 
 services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
   simulator:
     image: vda5050-vehicle-simulator:tg-1.0
+    depends_on:
+      - mqtt
     volumes:
       # Mount your local config.toml so you can adjust settings without
       # rebuilding the image. Remove this line to use the embedded defaults.
       - ./config.toml:/app/config.toml:ro
-    # Allows the container to reach an MQTT broker running on the Docker host
-    # via the hostname "host.docker.internal" on Linux (no-op on Mac / Windows).
+    # Allows the container to reach an external MQTT broker running on the host
+    # via "host.docker.internal" on Linux (no-op on Mac / Windows).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

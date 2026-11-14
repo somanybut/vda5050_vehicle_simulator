@@ -78,15 +78,16 @@ The repository ships a `Dockerfile` and two Compose files that let you build and
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yml` | Base file. Uses a pre-built image and expects an external MQTT broker. |
+| `docker-compose.yml` | Base file. Uses a pre-built simulator image and includes a local Mosquitto MQTT broker. |
 | `docker-compose.override.yml` | Development override. Adds a build context so the image is compiled from source. Applied automatically by Docker Compose when both files are present. |
 
+Run `docker compose up --build` to start the broker and build and start the simulator. The simulator connects to the broker through the Compose service name `mqtt`. The provided `mosquitto.conf` allows anonymous access and is intended only for isolated local testing.
 
 ## Requirements
 
 - **Rust**: Ensure that Rust is installed. You can follow the installation instructions [here](https://www.rust-lang.org/tools/install) if you don’t have it installed.
   
-- **MQTT Broker**: You'll need an MQTT broker such as [Mosquitto](https://mosquitto.org/). Install and run it on your machine to handle communication between the simulator and the system.
+- **MQTT Broker**: Native runs require an MQTT broker such as [Mosquitto](https://mosquitto.org/). The default Compose setup starts one automatically.
 
 ## Getting Started
 
