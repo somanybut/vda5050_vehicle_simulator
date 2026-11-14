@@ -8,7 +8,7 @@
 
 services:
   simulator:
-    image: vda5050-vehicle-simulator:latest
+    image: vda5050-vehicle-simulator:tg-1.0
     volumes:
       # Mount your local config.toml so you can adjust settings without
       # rebuilding the image. Remove this line to use the embedded defaults.
